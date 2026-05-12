@@ -1,10 +1,4 @@
-# Hash-INR-Rock
-
 **PoreNet: Structure-Preserving Neural Compression of Digital Rock Images via Pore-Connectivity Encoding**
-
-Yong Ren, Liangbin Dou, Ye Liu, Bin Wang, Min Zhang
-
-> Accepted by *Computers & Geosciences*
 
 ## Overview
 
@@ -72,7 +66,7 @@ Supported formats:
 - **Avizo/Amira** (`.am`) — segmented volumes with HxByteRLE compression
 - **NumPy** (`.npy`) — raw voxel arrays
 
-The MRCCM dataset can be downloaded from the [Digital Rocks Portal](https://www.digitalrocksportal.org/).
+The MRCCM dataset can be downloaded from the [Digital Rocks Portal](https://digitalporousmedia.org/published-datasets/drp.project.published.DRP-362).
 
 ### 2. Run Compression (PoreNet)
 
