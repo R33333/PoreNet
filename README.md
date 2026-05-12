@@ -1,4 +1,4 @@
-# PoreNet: Structure-Preserving Neural Compression of Digital Rock Images via Pore-Connectivity Encoding**
+# PoreNet: Structure-Preserving Neural Compression of Digital Rock Images via Pore-Connectivity Encoding
 
 ## Overview
 
