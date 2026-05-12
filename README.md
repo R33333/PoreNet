@@ -156,20 +156,10 @@ Both samples contain three segmented phases: pore (1), solid (0), and micro-poro
 Tested on:
 - **GPU**: NVIDIA Tesla T4 (16 GB)
 - **CPU**: Intel Xeon Gold 5218R (2×20 cores)
-- **RAM**: 256 GB
+- **RAM**: Greater than 64GB
 
 Training time: ~13–15 minutes per 256³ configuration (60 epochs).
 
-## Citation
-
-```bibtex
-@article{ren2026porenet,
-  title={PoreNet: Structure-Preserving Neural Compression of Digital Rock Images via Pore-Connectivity Encoding},
-  author={Ren, Yong and Dou, Liangbin and Liu, Ye and Wang, Bin and Zhang, Min},
-  journal={Computers \& Geosciences},
-  year={2026}
-}
-```
 
 ## Acknowledgments
 
