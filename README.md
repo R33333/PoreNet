@@ -36,6 +36,9 @@ Hash-INR-Rock/
 ├── huaTu.py               # Academic plotting style configuration
 ├── run_cloud.sh           # Shell script for batch experiments
 ├── requirements.txt       # Python dependencies
+├── test_data/
+│   ├── test_sandstone_64.npy   # Synthetic sandstone sample (64³, 256 KB)
+│   └── test_carbonate_64.npy   # Synthetic carbonate sample (64³, 256 KB)
 └── README.md
 ```
 
@@ -67,6 +70,15 @@ Supported formats:
 - **NumPy** (`.npy`) — raw voxel arrays
 
 The MRCCM dataset can be downloaded from the [Digital Rocks Portal](https://digitalporousmedia.org/published-datasets/drp.project.published.DRP-362).
+
+Quick test with included sample data — two synthetic 64³ volumes are provided in test_data/:
+```
+# Simple sandstone-like sample (~15% porosity, ~4% micro-porosity)
+python train.py --data test_data/test_sandstone_64.npy --epochs 5 --output output/test_sandstone
+
+# Complex carbonate-like sample (~19% porosity, ~11% micro-porosity)
+python train.py --data test_data/test_carbonate_64.npy --epochs 5 --output output/test_carbonate
+```
 
 ### 2. Run Compression (PoreNet)
 
