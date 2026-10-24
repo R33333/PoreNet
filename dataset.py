@@ -6,7 +6,7 @@
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-from typing import Optional
+from typing import Optional, Sequence
 import os
 
 from am_loader import read_am_file
@@ -28,6 +28,7 @@ class DigitalRockDataset(Dataset):
         normalize: bool = True,
         is_label_data: bool = False,
         sample_weights: Optional[np.ndarray] = None,
+        classification: bool = False,
     ):
         """
         Args:
@@ -37,16 +38,19 @@ class DigitalRockDataset(Dataset):
             is_label_data: 是否为标签数据（自动检测：如果唯一值<20则认为是标签）
             sample_weights: (D, H, W) 每个体素的采样/损失权重
         """
-        self.voxel_data = voxel_data.astype(np.float32)
+        self.voxel_data = voxel_data.astype(np.int64 if classification else np.float32)
         self.n_samples = n_samples_per_epoch
         self.shape = voxel_data.shape
 
         # 自动检测是否为标签数据
         unique_values = np.unique(voxel_data)
-        self.is_label_data = is_label_data or len(unique_values) < 20
+        self.classification = classification
+        self.is_label_data = (is_label_data or len(unique_values) < 20) and not classification
         self.unique_labels = unique_values
 
-        if self.is_label_data:
+        if self.classification:
+            print(f"分类标签数据，唯一值: {unique_values}")
+        elif self.is_label_data:
             # 标签数据：归一化到 [0, 1] 基于最大标签值
             max_label = self.voxel_data.max()
             if max_label > 0:
@@ -101,7 +105,7 @@ class DigitalRockDataset(Dataset):
 
         return (
             torch.from_numpy(coords),
-            torch.tensor([density], dtype=torch.float32),
+            torch.tensor([density], dtype=torch.long if self.classification else torch.float32),
             torch.tensor([weight], dtype=torch.float32),
         )
 
@@ -135,28 +139,112 @@ class DigitalRockDatasetFull(Dataset):
 
 
 
-def load_digital_rock(path: str, downsample: int = 1, crop_size: int = None) -> np.ndarray:
+def _normalize_crop_origin(
+    shape: Sequence[int], crop_size: Optional[int], crop_origin: Optional[Sequence[int]]
+) -> Optional[tuple[int, int, int]]:
+    if crop_size is None:
+        if crop_origin is not None:
+            raise ValueError("crop_origin requires crop_size")
+        return None
+    if crop_size <= 0 or crop_size > min(shape):
+        raise ValueError(f"crop_size={crop_size} is invalid for shape {tuple(shape)}")
+    if crop_origin is None:
+        return tuple((int(dim) - crop_size) // 2 for dim in shape)
+    if len(crop_origin) != 3:
+        raise ValueError("crop_origin must contain D H W")
+    origin = tuple(int(value) for value in crop_origin)
+    if any(start < 0 or start + crop_size > int(dim) for start, dim in zip(origin, shape)):
+        raise ValueError(
+            f"crop_origin={origin}, crop_size={crop_size} exceeds shape {tuple(shape)}"
+        )
+    return origin
+
+
+def _crop_slices(origin: Sequence[int], crop_size: int) -> tuple[slice, slice, slice]:
+    return tuple(slice(start, start + crop_size) for start in origin)
+
+
+def _infer_raw_shape(path: str, raw_shape: Optional[Sequence[int]]) -> tuple[int, int, int]:
+    if raw_shape is not None:
+        if len(raw_shape) != 3 or any(int(dim) <= 0 for dim in raw_shape):
+            raise ValueError("raw_shape must contain three positive dimensions")
+        shape = tuple(int(dim) for dim in raw_shape)
+    else:
+        voxel_count = os.path.getsize(path)
+        side = round(voxel_count ** (1.0 / 3.0))
+        if side ** 3 != voxel_count:
+            raise ValueError("Cannot infer RAW shape; pass --raw_shape D H W")
+        shape = (side, side, side)
+    expected_bytes = int(np.prod(shape))
+    if expected_bytes != os.path.getsize(path):
+        raise ValueError(
+            f"RAW shape {shape} expects {expected_bytes} uint8 bytes, "
+            f"but file has {os.path.getsize(path)} bytes"
+        )
+    return shape
+
+
+def load_digital_rock(
+    path: str,
+    downsample: int = 1,
+    crop_size: int = None,
+    crop_origin: Optional[Sequence[int]] = None,
+    raw_shape: Optional[Sequence[int]] = None,
+    nc_variable: str = "data",
+) -> np.ndarray:
     """
     加载数字岩心数据
 
     Args:
         path: AM文件路径或npy文件路径
         downsample: 下采样因子
-        crop_size: 裁剪尺寸（从中心裁剪立方体）
+        crop_size: 立方体裁剪尺寸
+        crop_origin: 裁剪起点，顺序为 D H W；不指定时使用中心裁剪
+        raw_shape: RAW 文件尺寸，顺序为 D H W；立方体 uint8 文件可自动推断
+        nc_variable: NetCDF/HDF5 中的体数据变量名
 
     Returns:
         voxel_data: (D, H, W) 体素数据
     """
     ext = os.path.splitext(path)[1].lower()
 
+    crop_applied = False
     if ext == '.npy':
         voxel_data = np.load(path)
     elif ext == '.am':
         voxel_data = read_am_file(path)
     elif ext == '.mat':
-        voxel_data = load_mat_volume(path, downsample=downsample, crop_size=crop_size)
-        crop_size = None
-        downsample = 1
+        voxel_data = load_mat_volume(
+            path,
+            downsample=1,
+            crop_size=crop_size,
+            crop_origin=crop_origin,
+        )
+        crop_applied = crop_size is not None
+        if crop_applied:
+            origin = tuple(crop_origin) if crop_origin is not None else None
+    elif ext == '.raw':
+        shape = _infer_raw_shape(path, raw_shape)
+        origin = _normalize_crop_origin(shape, crop_size, crop_origin)
+        raw_data = np.memmap(path, dtype=np.uint8, mode='r', shape=shape, order='C')
+        voxel_data = np.asarray(raw_data[_crop_slices(origin, crop_size)] if origin else raw_data)
+        crop_applied = origin is not None
+    elif ext == '.nc':
+        try:
+            import h5py
+        except ImportError as exc:
+            raise RuntimeError("Loading NetCDF4 files requires h5py") from exc
+        with h5py.File(path, 'r') as handle:
+            if nc_variable not in handle:
+                raise KeyError(
+                    f"NetCDF variable '{nc_variable}' not found; available: {list(handle.keys())}"
+                )
+            dataset = handle[nc_variable]
+            if dataset.ndim != 3:
+                raise ValueError(f"NetCDF variable must be 3D, got shape {dataset.shape}")
+            origin = _normalize_crop_origin(dataset.shape, crop_size, crop_origin)
+            voxel_data = dataset[_crop_slices(origin, crop_size)] if origin else dataset[...]
+            crop_applied = origin is not None
     else:
         raise ValueError(f"不支持的文件格式: {ext}")
 
@@ -164,17 +252,13 @@ def load_digital_rock(path: str, downsample: int = 1, crop_size: int = None) -> 
     print(f"原始数据大小: {voxel_data.nbytes / 1024 / 1024:.2f} MB")
 
     # 裁剪（用于测试或减少计算量）
-    if crop_size is not None and crop_size < min(voxel_data.shape):
+    if crop_size is not None and not crop_applied:
         D, H, W = voxel_data.shape
-        d_start = (D - crop_size) // 2
-        h_start = (H - crop_size) // 2
-        w_start = (W - crop_size) // 2
-        voxel_data = voxel_data[
-            d_start:d_start+crop_size,
-            h_start:h_start+crop_size,
-            w_start:w_start+crop_size
-        ]
-        print(f"裁剪到 {crop_size}³ 后形状: {voxel_data.shape}")
+        origin = _normalize_crop_origin((D, H, W), crop_size, crop_origin)
+        voxel_data = voxel_data[_crop_slices(origin, crop_size)]
+        print(f"从 {origin} 裁剪到 {crop_size}^3 后形状: {voxel_data.shape}")
+    elif crop_applied:
+        print(f"从 {origin} 裁剪到 {crop_size}^3 后形状: {voxel_data.shape}")
 
     if downsample > 1:
         voxel_data = voxel_data[::downsample, ::downsample, ::downsample]

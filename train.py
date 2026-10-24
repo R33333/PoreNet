@@ -5,6 +5,7 @@
 import argparse
 import json
 import os
+import random
 import time
 
 import numpy as np
@@ -17,6 +18,20 @@ from tqdm import tqdm
 from dataset import DigitalRockDataset, load_digital_rock
 from metrics import compute_metrics, compute_porosity, detect_dataset_type
 from model import DigitalRockINR, DigitalRockINRTinyCuda
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def infer_pore_labels(voxel_data: np.ndarray) -> list[int]:
@@ -78,6 +93,7 @@ def train(
     device: str,
     epoch: int,
     use_structure_weights: bool = False,
+    loss_type: str = 'mse',
 ):
     model.train()
     total_loss = 0.0
@@ -90,7 +106,11 @@ def train(
 
         pred = model(coords)
 
-        if use_structure_weights:
+        if loss_type == 'cross_entropy':
+            target = densities.long().view(-1)
+            ce = nn.functional.cross_entropy(pred, target, reduction='none')
+            loss = (ce * weights.view(-1)).mean() if use_structure_weights else ce.mean()
+        elif use_structure_weights:
             loss_map = (pred - densities) ** 2
             loss = (loss_map * weights).mean()
         else:
@@ -111,14 +131,27 @@ def validate(
     gt_volume: np.ndarray,
     device: str,
     pore_labels: list[int],
+    classification: bool = False,
+    label_values: np.ndarray | None = None,
 ):
     """验证模型"""
     model.eval()
 
     resolution = gt_volume.shape
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    reconstruction_start = time.perf_counter()
     with torch.no_grad():
         pred_volume = model.query_volume(resolution, device)
+        if classification:
+            pred_volume = torch.argmax(pred_volume, dim=-1).float()
+            if label_values is not None:
+                pred_volume = torch.as_tensor(label_values, device=pred_volume.device)[pred_volume.long()]
+                pred_volume = pred_volume / float(np.max(label_values))
         pred_volume = pred_volume.cpu().numpy()
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    reconstruction_time = time.perf_counter() - reconstruction_start
 
     gt_normalized = gt_volume.astype(np.float32)
 
@@ -154,20 +187,26 @@ def validate(
     metrics['porosity_gt'] = gt_porosity
     metrics['porosity_pred'] = pred_porosity
     metrics['porosity_error'] = abs(gt_porosity - pred_porosity)
+    metrics['reconstruction_time_seconds'] = reconstruction_time
 
     return metrics, pred_volume
 
 
 def main():
     parser = argparse.ArgumentParser(description='Train INR for Digital Rock')
-    parser.add_argument('--data', type=str, required=True, help='Path to AM or npy file')
+    parser.add_argument('--data', type=str, required=True, help='Path to AM, MAT, NPY, RAW, or NC file')
     parser.add_argument('--output', type=str, default='output/inr_experiment', help='Output directory')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=65536, help='Batch size')
+    parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker processes')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--samples_per_epoch', type=int, default=2000000, help='Samples per epoch')
     parser.add_argument('--downsample', type=int, default=1, help='Downsample factor')
     parser.add_argument('--crop_size', type=int, default=None, help='Crop size (for testing)')
+    parser.add_argument('--crop_origin', type=int, nargs=3, metavar=('D', 'H', 'W'), help='Explicit crop origin in D H W order')
+    parser.add_argument('--raw_shape', type=int, nargs=3, metavar=('D', 'H', 'W'), help='RAW uint8 shape in D H W order')
+    parser.add_argument('--nc_variable', type=str, default='data', help='Volume variable in NetCDF4/HDF5 files')
+    parser.add_argument('--seed', type=int, default=2026, help='Random seed')
     parser.add_argument('--use_tcnn', action='store_true', help='Use tiny-cuda-nn')
     parser.add_argument('--encoding_type', type=str, default='hash', choices=['hash', 'hybrid', 'sinusoidal'], help='Encoding type for the PyTorch INR model')
     parser.add_argument('--use_siren', action='store_true', help='Use SIREN (sine activation) instead of ReLU')
@@ -179,6 +218,7 @@ def main():
     parser.add_argument('--plane_log2_hashmap_size', type=int, default=15, help='Log2 hashmap size for each plane-feature table')
     parser.add_argument('--plane_n_features_per_level', type=int, default=2, help='Features per level for plane-feature encoding')
     parser.add_argument('--plane_base_resolution', type=int, default=16, help='Base resolution for plane-feature encoding')
+    parser.add_argument('--plane_axes', nargs='+', choices=['xy', 'xz', 'yz'], default=['xy', 'xz', 'yz'], help='Active feature planes')
     parser.add_argument('--hidden_dim', type=int, default=64, help='Hidden dimension')
     parser.add_argument('--n_hidden_layers', type=int, default=3, help='Number of hidden layers')
     parser.add_argument('--pore_label', type=int, default=None, help='Optional single pore label override')
@@ -186,34 +226,52 @@ def main():
     parser.add_argument('--boundary_weight', type=float, default=1.5, help='Extra weight for phase boundaries in PoreGuard-INR')
     parser.add_argument('--throat_weight', type=float, default=1.0, help='Extra weight for narrow pore/throat voxels in PoreGuard-INR')
     parser.add_argument('--throat_radius', type=float, default=2.5, help='Distance threshold in voxels for throat emphasis')
+    parser.add_argument('--loss_type', choices=['mse', 'cross_entropy'], default='mse', help='Label loss: scalar MSE or categorical cross-entropy')
 
     args = parser.parse_args()
+    if args.use_tcnn and args.loss_type == 'cross_entropy':
+        raise ValueError('Categorical experiment uses the PyTorch encoder for both arms.')
 
     os.makedirs(args.output, exist_ok=True)
+    seed_everything(args.seed)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
     print(f"Loading data from: {args.data}")
-    voxel_data = load_digital_rock(args.data, args.downsample, args.crop_size)
+    voxel_data = load_digital_rock(
+        args.data,
+        downsample=args.downsample,
+        crop_size=args.crop_size,
+        crop_origin=args.crop_origin,
+        raw_shape=args.raw_shape,
+        nc_variable=args.nc_variable,
+    )
     print(f"Volume shape: {voxel_data.shape}")
 
+    original_voxel_data = voxel_data.copy()
     unique_values = np.unique(voxel_data)
     is_label_data = len(unique_values) < 20
     max_label = float(voxel_data.max()) if voxel_data.max() > 0 else 1.0
+    label_values = np.sort(unique_values.astype(np.int64)) if is_label_data else None
+    label_to_index = {int(v): i for i, v in enumerate(label_values)} if label_values is not None else None
+    if args.loss_type == 'cross_entropy' and not is_label_data:
+        raise ValueError('--loss_type cross_entropy requires segmented label data')
+    if args.loss_type == 'cross_entropy':
+        voxel_data = np.vectorize(label_to_index.get)(voxel_data).astype(np.int64)
     print(f"Is label data: {is_label_data}, Max label: {max_label}")
 
-    pore_labels = [args.pore_label] if args.pore_label is not None else infer_pore_labels(voxel_data)
+    pore_labels = [args.pore_label] if args.pore_label is not None else infer_pore_labels(original_voxel_data)
     print(f"Pore labels used for topology/porosity evaluation: {pore_labels}")
 
-    original_size = voxel_data.nbytes
+    original_size = original_voxel_data.nbytes
     print(f"Original size: {original_size / 1024 / 1024:.2f} MB")
 
     sample_weights = None
     if args.use_siren:
         method_name = 'COIN (SIREN)'
     elif args.encoding_type == 'hybrid':
-        method_name = 'PoreGuard-HGP' if args.use_structure_loss else 'HGP-INR baseline'
+        method_name = 'PoreNet' if args.use_structure_loss else 'HGP-INR baseline'
     else:
         method_name = 'PoreGuard-INR' if args.use_structure_loss else 'Hash-INR baseline'
     print(f"Method: {method_name}")
@@ -230,7 +288,7 @@ def main():
             f'throat_radius={args.throat_radius})...'
         )
         sample_weights = build_structure_weight_map(
-            voxel_data,
+            original_voxel_data,
             pore_labels=pore_labels,
             boundary_weight=args.boundary_weight,
             throat_weight=args.throat_weight,
@@ -240,15 +298,20 @@ def main():
     dataset = DigitalRockDataset(
         voxel_data,
         n_samples_per_epoch=args.samples_per_epoch,
-        is_label_data=is_label_data,
+        is_label_data=is_label_data and args.loss_type == 'mse',
         sample_weights=sample_weights,
+        classification=args.loss_type == 'cross_entropy',
     )
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed)
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=loader_generator,
     )
 
     if args.use_tcnn:
@@ -276,8 +339,10 @@ def main():
             plane_log2_hashmap_size=args.plane_log2_hashmap_size,
             plane_base_resolution=args.plane_base_resolution,
             plane_finest_resolution=max(voxel_data.shape),
+            plane_axes=args.plane_axes,
             use_siren=args.use_siren,
             siren_omega_0=args.siren_omega_0,
+            output_dim=len(label_values) if args.loss_type == 'cross_entropy' else 1,
         ).to(device)
 
     model_size = sum(p.numel() * p.element_size() for p in model.parameters())
@@ -291,7 +356,10 @@ def main():
     train_losses = []
     val_metrics_history = []
 
-    start_time = time.time()
+    if device == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start_time = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
         loss = train(
@@ -301,6 +369,7 @@ def main():
             device,
             epoch,
             use_structure_weights=args.use_structure_loss,
+            loss_type=args.loss_type,
         )
         train_losses.append(loss)
         scheduler.step()
@@ -308,7 +377,11 @@ def main():
         print(f"Epoch {epoch}/{args.epochs}, Loss: {loss:.6f}, LR: {scheduler.get_last_lr()[0]:.6f}")
 
         if epoch % args.validate_every == 0 or epoch == args.epochs:
-            metrics, pred_volume = validate(model, voxel_data, device, pore_labels)
+            metrics, pred_volume = validate(
+                model, original_voxel_data if args.loss_type == 'cross_entropy' else voxel_data, device, pore_labels,
+                classification=args.loss_type == 'cross_entropy',
+                label_values=label_values,
+            )
             val_metrics_history.append(metrics)
 
             print(f"  Validation - PSNR: {metrics['psnr']:.2f} dB, SSIM: {metrics['ssim']:.4f}")
@@ -331,19 +404,27 @@ def main():
                 np.save(os.path.join(args.output, 'best_reconstruction.npy'), pred_volume)
                 print(f"  Saved best model (PSNR: {best_psnr:.2f} dB)")
 
-    training_time = time.time() - start_time
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    training_time = time.perf_counter() - start_time
+    peak_gpu_memory_mb = (
+        torch.cuda.max_memory_allocated() / 1024 / 1024 if device == 'cuda' else 0.0
+    )
     print(f"\nTraining completed in {training_time:.2f} seconds ({training_time/60:.2f} minutes)")
 
     torch.save(model.state_dict(), os.path.join(args.output, 'final_model.pth'))
+    np.save(os.path.join(args.output, 'final_reconstruction.npy'), pred_volume)
 
     results = {
         'method': method_name,
+        'label_values': label_values.tolist() if label_values is not None else None,
         'args': vars(args),
         'original_size_mb': original_size / 1024 / 1024,
         'model_size_mb': model_size / 1024 / 1024,
         'compression_ratio': original_size / model_size,
         'best_psnr': best_psnr,
         'training_time_seconds': training_time,
+        'peak_gpu_memory_mb': peak_gpu_memory_mb,
         'train_losses': train_losses,
         'val_metrics': val_metrics_history,
     }

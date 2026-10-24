@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 
 class SinusoidalEncoding(nn.Module):
@@ -70,12 +70,20 @@ class HashEncoding(nn.Module):
 class PlaneHashEncoding(nn.Module):
     def __init__(self, n_levels: int = 8, n_features_per_level: int = 2,
                  log2_hashmap_size: int = 15, base_resolution: int = 16,
-                 finest_resolution: int = 512):
+                 finest_resolution: int = 512,
+                 plane_axes: Sequence[str] = ('xy', 'xz', 'yz')):
         super().__init__()
         self.n_levels = n_levels
         self.n_features_per_level = n_features_per_level
         self.hashmap_size = 2 ** log2_hashmap_size
-        self.n_planes = 3
+        valid_axes = {'xy': (0, 1), 'xz': (0, 2), 'yz': (1, 2)}
+        if not plane_axes or len(set(plane_axes)) != len(plane_axes):
+            raise ValueError('plane_axes must contain unique values')
+        if any(axis not in valid_axes for axis in plane_axes):
+            raise ValueError(f'Unsupported plane axes: {plane_axes}')
+        self.plane_axes = tuple(plane_axes)
+        self.axis_indices = tuple(valid_axes[axis] for axis in self.plane_axes)
+        self.n_planes = len(self.plane_axes)
         b = np.exp((np.log(finest_resolution) - np.log(base_resolution)) / max(n_levels - 1, 1))
         self.resolutions = [int(np.ceil(base_resolution * (b ** i))) for i in range(n_levels)]
         self.plane_tables = nn.ParameterList([
@@ -85,7 +93,7 @@ class PlaneHashEncoding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.clamp(x, 0.0, 1.0 - 1e-6)
-        plane_coords = (x[:, [0, 1]], x[:, [0, 2]], x[:, [1, 2]])
+        plane_coords = tuple(x[:, indices] for indices in self.axis_indices)
         all_features = []
         for plane_id, coords_2d in enumerate(plane_coords):
             for level, resolution in enumerate(self.resolutions):
@@ -123,13 +131,15 @@ class HybridGridPlaneEncoding(nn.Module):
                  plane_n_features_per_level: int = 2,
                  plane_log2_hashmap_size: int = 15,
                  plane_base_resolution: int = 16,
-                 plane_finest_resolution: Optional[int] = None):
+                 plane_finest_resolution: Optional[int] = None,
+                 plane_axes: Sequence[str] = ('xy', 'xz', 'yz')):
         super().__init__()
         self.grid_encoder = HashEncoding(n_levels, n_features_per_level, log2_hashmap_size,
                                          base_resolution, finest_resolution)
         self.plane_encoder = PlaneHashEncoding(
             plane_n_levels, plane_n_features_per_level, plane_log2_hashmap_size,
             plane_base_resolution, plane_finest_resolution or finest_resolution,
+            plane_axes,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -178,10 +188,14 @@ class DigitalRockINR(nn.Module):
                  plane_log2_hashmap_size: int = 15,
                  plane_base_resolution: int = 16,
                  plane_finest_resolution: Optional[int] = None,
-                 use_siren: bool = False, siren_omega_0: float = 30.0):
+                 plane_axes: Sequence[str] = ('xy', 'xz', 'yz'),
+                 use_siren: bool = False, siren_omega_0: float = 30.0,
+                 output_dim: int = 1):
         super().__init__()
         self.encoding_type = encoding_type
         self.use_siren = use_siren
+        self.output_dim = output_dim
+        self.classification = output_dim > 1
         
         # SIREN: no encoding, direct coordinate input
         if use_siren:
@@ -191,8 +205,9 @@ class DigitalRockINR(nn.Module):
             layers.append(SirenLayer(in_dim, hidden_dim, omega_0=siren_omega_0, is_first=True))
             for _ in range(n_hidden_layers):
                 layers.append(SirenLayer(hidden_dim, hidden_dim, omega_0=siren_omega_0))
-            layers.append(SirenLayer(hidden_dim, 1, omega_0=siren_omega_0, is_last=True))
-            layers.append(nn.Sigmoid())
+            layers.append(SirenLayer(hidden_dim, output_dim, omega_0=siren_omega_0, is_last=True))
+            if not self.classification:
+                layers.append(nn.Sigmoid())
             self.mlp = nn.Sequential(*layers)
         else:
             # Standard encoding + MLP
@@ -204,6 +219,7 @@ class DigitalRockINR(nn.Module):
                     n_levels, n_features_per_level, log2_hashmap_size, base_resolution,
                     finest_resolution, plane_n_levels, plane_n_features_per_level,
                     plane_log2_hashmap_size, plane_base_resolution, plane_finest_resolution,
+                    plane_axes,
                 )
             elif encoding_type == 'sinusoidal':
                 self.encoder = SinusoidalEncoding(n_frequencies)
@@ -216,8 +232,9 @@ class DigitalRockINR(nn.Module):
                 layers.append(nn.Linear(in_dim, hidden_dim))
                 layers.append(nn.ReLU(inplace=True))
                 in_dim = hidden_dim
-            layers.append(nn.Linear(hidden_dim, 1))
-            layers.append(nn.Sigmoid())
+            layers.append(nn.Linear(hidden_dim, output_dim))
+            if not self.classification:
+                layers.append(nn.Sigmoid())
             self.mlp = nn.Sequential(*layers)
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
@@ -229,7 +246,8 @@ class DigitalRockINR(nn.Module):
     def query_volume(self, resolution: Tuple[int, int, int], device: str = 'cuda',
                      chunk_size: int = 64) -> torch.Tensor:
         D, H, W = resolution
-        volume = torch.zeros(D, H, W, dtype=torch.float32)
+        channels = self.output_dim
+        volume = torch.zeros(D, H, W, channels, dtype=torch.float32)
         y = torch.linspace(0, 1, H, device=device)
         x = torch.linspace(0, 1, W, device=device)
         yy, xx = torch.meshgrid(y, x, indexing='ij')
@@ -237,7 +255,7 @@ class DigitalRockINR(nn.Module):
         with torch.no_grad():
             for z_start in range(0, D, chunk_size):
                 z_end = min(z_start + chunk_size, D)
-                z_vals = torch.linspace(z_start / D, (z_end - 1) / D, z_end - z_start, device=device)
+                z_vals = torch.arange(z_start, z_end, device=device, dtype=torch.float32) / max(D - 1, 1)
                 chunk_densities = []
                 for z_val in z_vals:
                     z_coord = torch.full((H * W, 1), z_val.item(), device=device)
@@ -245,10 +263,12 @@ class DigitalRockINR(nn.Module):
                     layer_density = []
                     for i in range(0, coords.shape[0], 256 * 256):
                         layer_density.append(self(coords[i:i + 256 * 256]).cpu())
-                    chunk_densities.append(torch.cat(layer_density, dim=0).reshape(H, W))
+                    chunk_densities.append(torch.cat(layer_density, dim=0).reshape(H, W, channels))
                 volume[z_start:z_end] = torch.stack(chunk_densities, dim=0)
                 if (z_start // chunk_size) % 5 == 0:
                     print(f"  Reconstructing: {z_end}/{D} slices ({100 * z_end / D:.1f}%)")
+        if channels == 1:
+            volume = volume[..., 0]
         if volume.numel() * volume.element_size() / (1024 ** 3) > 20:
             return volume
         return volume.to(device)
