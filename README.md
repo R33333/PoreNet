@@ -1,44 +1,76 @@
+```markdown
 # PoreNet: Structure-Preserving Neural Compression of Digital Rock Images via Pore-Connectivity Encoding
 
 ## Overview
 
-PoreNet is a structure-preserving neural compression framework for segmented digital rock micro-CT images. It addresses the key limitation of generic implicit neural representations (INR): failure to preserve petrophysically critical properties such as porosity and pore connectivity during compression.
+PoreNet is a structure-aware neural compression framework for segmented digital-rock micro-CT images. It combines a Pore-Connectivity Encoder (PCE), which integrates local 3D hash-grid features with orthogonal-plane features, and a Geometry-Weighted Loss (GWL), which emphasizes phase interfaces and boundary-adjacent pore regions during training.
 
-**Key results** (ILS sandstone-like carbonate, 8× compression):
-- Porosity error reduced by **96%** compared to Instant-NGP baseline
-- Connectivity error reduced by **76%**
-- PSNR improved by +0.5%, label accuracy improved by +0.14%
+PoreNet is designed as a task-oriented lossy representation for remote visualization, data transfer, and structure-based screening. It is not intended to replace lossless archival storage or calibrated permeability and multiphase-flow simulations.
 
-### Two core innovations
+## Main Results
 
-1. **Pore-Connectivity Encoder (PCE)**: Combines 3D hash grids with orthogonal plane features to capture both fine-grained pore boundaries and cross-slice connectivity patterns.
-2. **Geometry-Weighted Loss (GWL)**: Assigns higher reconstruction weights to phase boundaries and narrow pore throats based on geometric analysis.
+The detailed baseline, ablation, capacity, parameter-matched, and spatial-crop analyses focus on the ILS and MEC carbonate samples. A separate cohort experiment evaluates eight samples consisting of four sandstone samples and four carbonate samples.
+
+On the ILS crop at approximately 6.7x compression, PoreNet:
+
+- Reduces porosity error by 96% relative to the Hash-INR baseline.
+- Reduces largest-connected-component error by 76%.
+- Improves selected reconstruction metrics.
+- Produces a larger representation and a lower nominal compression ratio than the Hash-INR baseline.
+- Does not uniformly improve component-count or fine-scale topological accuracy.
+
+The eight-sample cohort includes four sandstone samples and four carbonate samples. Relative to the Hash-INR baseline, PoreNet reduces the cohort mean porosity error by 75.4%, largest-connected-component error by 87.0%, and specific-surface-area error by 52.3% under the tested protocol.
+
+## Scope and Limitations
+
+The primary operating regime demonstrated in the study is the tested 256^3 crop range with the evaluated log15 configuration.
+
+The 512^3 scale-stress experiment shows that PoreNet can improve porosity agreement at a larger crop size, but connectivity and component-count errors increase. Larger-volume deployment therefore requires validation of the target structural descriptors and may require increased model capacity, tiled processing, hierarchical reconstruction, or spatially adaptive encoding.
+
+The repository also includes experiments for:
+
+- Random-seed repeatability.
+- Hash-table capacity sensitivity.
+- Parameter-matched 3D hash baselines.
+- Spatial-crop robustness.
+- Scalar label-permutation sensitivity.
+- Relative transport-proxy evaluation.
+- Optional small-component filtering.
+
+The transport-proxy experiment is a dimensionless voxel-graph test. It does not establish absolute Darcy permeability, multiphase relative permeability, or general validity for calibrated flow simulations.
 
 ## Project Structure
 
-```
-Hash-INR-Rock/
-├── model.py               # PoreNet model (Hash Encoding + Plane Features + MLP)
-├── train.py               # Main training script
-├── dataset.py             # Dataset loading (AM, MAT, NPY formats)
-├── metrics.py             # Evaluation metrics (PSNR, SSIM, porosity, connectivity)
-├── am_loader.py           # Avizo/Amira AM file reader (HxByteRLE)
-├── load_mrccm.py          # MRCCM dataset loader (HDF5 .mat)
-├── preprocess_data.py     # Data inspection and preprocessing
-├── check_am_header.py     # Lightweight AM file header checker
-├── run_experiments.py     # Batch experiment runner
-├── super_resolution.py    # Super-resolution experiment (additional capability)
-├── visualize.py           # Publication-quality figure generation
-├── generate_visuals.py    # Generate visualizations from trained models
-├── summarize_results.py   # Aggregate experiment results
-├── summarize_all_results.py  # Full results comparison table
-├── quick_test.py          # Quick validation test
-├── huaTu.py               # Academic plotting style configuration
-├── run_cloud.sh           # Shell script for batch experiments
-├── requirements.txt       # Python dependencies
+```text
+PoreNet/
+├── model.py
+├── train.py
+├── dataset.py
+├── metrics.py
+├── am_loader.py
+├── load_mrccm.py
+├── preprocess_data.py
+├── check_am_header.py
+├── run_experiments.py
+├── generate_visuals.py
+├── visualize.py
+├── summarize_results.py
+├── summarize_all_results.py
+├── quick_test.py
+├── transport_proxy.py
+├── label_permutation_experiment.py
+├── postprocess_filter.py
+├── requirements.txt
+├── configs/
+│   ├── crop_coordinates.json
+│   ├── random_seeds.json
+│   ├── ils_crop256_porenet.json
+│   ├── ils_crop256_hash_inr.json
+│   ├── mec_crop256_porenet.json
+│   └── ils_crop512_porenet.json
 ├── test_data/
-│   ├── test_sandstone_64.npy   # Synthetic sandstone sample (64³, 256 KB)
-│   └── test_carbonate_64.npy   # Synthetic carbonate sample (64³, 256 KB)
+│   ├── test_sandstone_64.npy
+│   └── test_carbonate_64.npy
 └── README.md
 ```
 
@@ -46,41 +78,49 @@ Hash-INR-Rock/
 
 ### Requirements
 
-- Python 3.8+
-- PyTorch 2.0+
-- CUDA 11.8+ (GPU required)
+- Python 3.8 or later.
+- PyTorch 2.7.1.
+- CUDA 11.8.
+- NumPy.
+- SciPy.
+- scikit-image.
+- h5py.
+- Matplotlib.
+- tqdm.
+- Pillow.
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt
 ```
 
-**Optional** (for faster training):
+Optional accelerated hash encoding:
+
 ```bash
 pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
 ```
 
-## Quick Start
+## Quick Test
 
-### 1. Data Preparation
+Two small 64^3 example volumes are included in `test_data/`:
 
-Supported formats:
-- **MATLAB HDF5** (`.mat`) — MRCCM dataset (ILS, MEC samples)
-- **Avizo/Amira** (`.am`) — segmented volumes with HxByteRLE compression
-- **NumPy** (`.npy`) — raw voxel arrays
-
-The MRCCM dataset can be downloaded from the [Digital Rocks Portal](https://digitalporousmedia.org/published-datasets/drp.project.published.DRP-362).
-
-Quick test with included sample data — two synthetic 64³ volumes are provided in test_data/:
-```
-# Simple sandstone-like sample (~15% porosity, ~4% micro-porosity)
-python train.py --data test_data/test_sandstone_64.npy --epochs 5 --output output/test_sandstone
-
-# Complex carbonate-like sample (~19% porosity, ~11% micro-porosity)
-python train.py --data test_data/test_carbonate_64.npy --epochs 5 --output output/test_carbonate
+```bash
+python train.py \
+    --data test_data/test_sandstone_64.npy \
+    --epochs 5 \
+    --output output/test_sandstone
 ```
 
-### 2. Run Compression (PoreNet)
+```bash
+python train.py \
+    --data test_data/test_carbonate_64.npy \
+    --epochs 5 \
+    --output output/test_carbonate
+```
+
+These files are demonstration inputs and are not the original Digital Rocks Portal samples.
+
+## Main PoreNet Experiment
 
 ```bash
 python train.py \
@@ -94,10 +134,13 @@ python train.py \
     --plane_log2_hashmap_size 13 \
     --boundary_weight 1.5 \
     --throat_weight 1.0 \
+    --batch_size 32768 \
+    --lr 1e-3 \
+    --seed 2026 \
     --output output/ils_crop256_porenet
 ```
 
-### 3. Run Instant-NGP Baseline
+## Hash-INR Baseline
 
 ```bash
 python train.py \
@@ -106,77 +149,168 @@ python train.py \
     --epochs 60 \
     --n_levels 16 \
     --log2_hashmap_size 15 \
-    --output output/ils_crop256_baseline
+    --batch_size 32768 \
+    --lr 1e-3 \
+    --seed 2026 \
+    --output output/ils_crop256_hash_inr
 ```
 
-### 4. Batch Experiments
+## Preprocessing
+
+Supported input formats include:
+
+- MATLAB HDF5 `.mat` files for MRCCM data.
+- Avizo/Amira `.am` segmented volumes.
+- NumPy `.npy` voxel arrays.
+
+The preprocessing workflow does not use interpolation, intensity rescaling, augmentation, or random spatial cropping. Dataset-specific labels are retained as integers during loading. Normalized scalar codes are assigned only for model training.
+
+Example:
 
 ```bash
-bash run_cloud.sh quick        # Quick test (256³ crop, 20 epochs)
-bash run_cloud.sh compression  # Full compression experiment
-bash run_cloud.sh all          # All experiments
+python preprocess_data.py \
+    --data path/to/input_volume \
+    --all \
+    --output preprocessed
 ```
 
-### 5. Summarize Results
+## Dataset Sources
 
-```bash
-python summarize_all_results.py
-```
+The experiments use eight segmented samples:
 
-## Key Parameters
+| Samples | Rock type | Source |
+|---|---|---|
+| Berea, Bentheimer, Bandera Gray, Parker | Sandstone | Digital Rocks Portal project DRP-317 |
+| ILS, MEC | Carbonate | MRCCM dataset |
+| P01, SW01 | Carbonate | Digital Rocks Portal project DRP-503 |
 
-### Model
+The original Digital Rocks Portal datasets are not redistributed in this repository. Users should obtain the source data from the corresponding project pages and comply with their terms of use.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--n_levels` | 16 | Number of hash encoding levels |
-| `--log2_hashmap_size` | 15 | Hash table size (2^15 entries per level) |
-| `--hidden_dim` | 64 | MLP hidden layer width |
-| `--use_plane_features` | False | Enable PCE orthogonal plane branch |
-| `--plane_levels` | 4 | Number of plane encoding levels |
-| `--plane_log2_hashmap_size` | 13 | Plane hash table size |
+ILS and MEC contain three segmented phases: pore, solid, and micro-porosity. The remaining six cohort samples are binary pore-solid volumes.
 
-### GWL (Geometry-Weighted Loss)
+## Main Parameters
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--boundary_weight` | 1.5 | Weight for phase boundary voxels |
-| `--throat_weight` | 1.0 | Weight for narrow pore throat voxels |
-| `--throat_radius` | 2.5 | Throat detection radius (voxels) |
+### Hash-grid and decoder
+
+| Parameter | Value |
+|---|---:|
+| Hash levels | 16 |
+| 3D hash-table capacity | 2^15 entries per level |
+| 3D features per level | 2 |
+| Base resolution | 16 |
+| Plane levels | 4 |
+| Plane hash-table capacity | 2^13 entries per level |
+| Decoder hidden layers | 3 |
+| Decoder width | 64 neurons per layer |
+| Activation | ReLU |
+| Output activation | Sigmoid |
+
+### GWL
+
+| Parameter | Value |
+|---|---:|
+| Boundary weight | 1.5 |
+| Boundary-adjacent pore weight | 1.0 |
+| Near-region threshold | 2.5 voxels |
 
 ### Training
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--epochs` | 60 | Training epochs |
-| `--batch_size` | 2^15 | Samples per iteration |
-| `--lr` | 1e-3 | Learning rate (Adam + cosine annealing) |
+| Parameter | Value |
+|---|---:|
+| Optimizer | Adam |
+| Initial learning rate | 1e-3 |
+| Scheduler | Cosine annealing |
+| Epochs | 60 |
+| Batch size | 32768 |
+| Samples per epoch | 1048576 |
+| Default seed | 2026 |
+| Repeatability seeds | 2026, 2027, 2028 |
 
-## Datasets
+## Reproducibility Records
 
-Experiments use the **Multi-Resolution Complex Carbonates Micro-CT Dataset (MRCCM)**:
+The `configs/` directory records:
 
-| Sample | Type | Micro-porosity | Characteristics |
-|--------|------|----------------|-----------------|
-| ILS | Sandstone-like carbonate | ~5% | Relatively homogeneous |
-| MEC | Complex carbonate | ~14% | Fine-grained, high complexity |
+- Crop size.
+- Crop origin.
+- Random seed.
+- Hash-grid parameters.
+- Plane-feature parameters.
+- Decoder configuration.
+- Optimizer and scheduler.
+- Batch size.
+- Samples per epoch.
+- Number of epochs.
+- GWL weights.
+- Output file locations.
 
-Both samples contain three segmented phases: pore (1), solid (0), and micro-porosity (3).
+The primary experiments use 256^3 crops. The spatial-crop experiment uses the following offsets along the first dimension:
+
+```text
+ILS:
+(0, 632, 632)
+(1648, 632, 632)
+(3296, 632, 632)
+
+MEC:
+(0, 632, 632)
+(1922, 632, 632)
+(3844, 632, 632)
+```
+
+The repeatability experiment uses seeds 2026, 2027, and 2028.
+
+## Output Files
+
+Training produces:
+
+```text
+best_model.pth
+final_model.pth
+best_reconstruction.npy
+results.json
+```
+
+The trained representations are stored as PyTorch state-dictionary checkpoints. Reconstructed volumes are stored as `.npy` files, and metric summaries are stored as `.json` files.
+
+## Additional Analyses
+
+### Label-permutation sensitivity
+
+```bash
+python label_permutation_experiment.py
+```
+
+The experiment evaluates the six possible three-phase label encodings:
+
+```text
+123, 132, 213, 231, 312, 321
+```
+
+### Relative transport proxy
+
+```bash
+python transport_proxy.py \
+    --ground-truth path/to/ground_truth.npy \
+    --reconstruction path/to/reconstruction.npy \
+    --output output/transport_proxy.json
+```
+
+The proxy downsamples pore masks to 64^3 using 4^3 block majority voting and evaluates a unit-conductance six-neighbour voxel graph. It reports conductance normalized by the corresponding ground-truth value.
+
+### Result summaries
+
+```bash
+python summarize_results.py
+python summarize_all_results.py
+```
 
 ## Hardware
 
-Tested on:
-- **GPU**: NVIDIA Tesla T4 (16 GB)
-- **CPU**: Intel Xeon Gold 5218R (2×20 cores)
-- **RAM**: Greater than 64GB
+The reported experiments were conducted using:
 
-Training time: ~13–15 minutes per 256³ configuration (60 epochs).
+- NVIDIA Tesla T4 GPU with 16 GB memory.
+- PyTorch 2.7.1.
+- CUDA 11.8.
 
+A 256^3 crop takes approximately 13–15 minutes per configuration for 60 epochs on one Tesla T4 GPU. The reported time depends on the hardware, configuration, and input volume.
 
-## Acknowledgments
-
-This research was supported by the National Science and Technology Major Project (Grant No. 2025ZD1404300). We thank the [Digital Rocks Portal](https://www.digitalrocksportal.org/) for providing data infrastructure and the contributors of the MRCCM dataset.
-
-## License
-
-MIT License
